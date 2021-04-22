@@ -20,7 +20,25 @@
  * Boston, MA 02110-1301, USA.
  */
 
+#include <asm-generic/socket.h>
 #define _FILE_OFFSET_BITS 64
+
+/*----------------socket include----------------*/
+/*for socket test
+ * 2020-11-11 14:15:18
+ * by zuko
+ * *
+ */
+#define SND_BUF_SIZE (262144 * 16)
+#define RCV_BUF_SIZE (262144 * 16)
+#define SOCKET_LISTEN_LIST 5
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+
+/*----------------socket include end----------------*/
 
 #include <hackrf.h>
 
@@ -317,9 +335,44 @@ char* u64toa(uint64_t val, t_u64toa* str)
 	return res;
 }
 
+/*-----------------socket paras-----------------*/
+/* 2020-11-11 17:17:43
+ * by zuko
+ * */
+struct sockaddr_in servaddr;
+struct sockaddr_in clientaddr;
+socklen_t client_addr_len = sizeof(clientaddr);
+
+int sockfd;
+int connectfd;
+
+int s_port = 0;
+char * s_host;
+
+bool using_socket = 0;
+
+int sbuf_size;
+socklen_t optlen;
+
+static int callback_count = 0;
+
+/* pointers for global ring list created in socket thread defined in hackrf.c
+ * 2021-03-24 07:50:52
+ * by zuko
+ * */
+extern pNode head, p_write, p_read;
+
+/* shared end flag between hackrf_tx thread and socket thread
+ * 2021-04-07 04:06:39
+ * by zuko
+ * */
+extern bool socket_thread_end;
+
+/*-----------------socket paras end-----------------*/
+
 static volatile bool do_exit = false;
 
-FILE* file = NULL;
+FILE* fd = NULL;
 volatile uint32_t byte_count = 0;
 
 bool signalsource = false;
@@ -378,10 +431,22 @@ int requested_mode_count = 0;
 int rx_callback(hackrf_transfer* transfer) {
 	size_t bytes_to_write;
 	size_t bytes_written;
-	unsigned int i;
 
-	if( file != NULL )
+	/* socket client
+	 * used to test bytes sent by send()
+	 * by zuko
+	 * */
+	size_t bytes_sent;
+
+	/* socket cilent
+	 * rx_callback count 
+	 * by zuko
+	 * */
+	callback_count++;
+
+	if( fd != NULL ) 
 	{
+		unsigned int i;
 		byte_count += transfer->valid_length;
 		bytes_to_write = transfer->valid_length;
 		if (limit_num_samples) {
@@ -412,13 +477,39 @@ int rx_callback(hackrf_transfer* transfer) {
 #endif
 		    return 0;
 		} else {
-			bytes_written = fwrite(transfer->buffer, 1, bytes_to_write, file);
-			if ((bytes_written != bytes_to_write)
-				|| (limit_num_samples && (bytes_to_xfer == 0))) {
-				return -1;
-			} else {
+			if (!using_socket)
+			{
+
+ 				bytes_written = fwrite(transfer->buffer, 1, bytes_to_write, fd);
+				if ((bytes_written != bytes_to_write)
+					|| (limit_num_samples && (bytes_to_xfer == 0))) 
+					return -1;
+				else 
+					return 0;
+			}
+
+			/*------------------socket client write(in rx_callback)------------------*/	
+			/* 2020-11-11 17:04:31
+			 * by zuko
+			 * */
+			else
+			{
+				if ((bytes_sent = send(sockfd, transfer->buffer, bytes_to_write, 0)) < 0)
+				{
+					printf("sending messages failed: %s(errno: %d)\n", strerror(errno), errno);
+					return -1;
+				}
+					
+#ifdef PRINT_MSG
+				printf("bytes sent = %lu\n", bytes_sent);
+#endif
+
 				return 0;
 			}
+			/*------------------socket client write end------------------*/	
+			
+		
+			
 		}
 	} else {
 		return -1;
@@ -430,59 +521,102 @@ int tx_callback(hackrf_transfer* transfer) {
 	size_t bytes_read;
 	unsigned int i;
 
-	if( file != NULL )
+
+	callback_count++;
+
+	/*
+	 * 2020年12月28日 星期一 16时38分05秒
+	 * by zuko
+	 */
+	if (!using_socket)
 	{
-		byte_count += transfer->valid_length;
-		bytes_to_read = transfer->valid_length;
-		if (limit_num_samples) {
-			if (bytes_to_read >= bytes_to_xfer) {
-				/*
-				 * In this condition, we probably tx some of the previous
-				 * buffer contents at the end.  :-(
-				 */
-				bytes_to_read = bytes_to_xfer;
-			}
-			bytes_to_xfer -= bytes_to_read;
-		}
-		bytes_read = fread(transfer->buffer, 1, bytes_to_read, file);
-		if (limit_num_samples && (bytes_to_xfer == 0)) {
-                               return -1;
-		}
-		if (bytes_read != bytes_to_read) {
-                       if (repeat) {
-                               fprintf(stderr, "Input file end reached. Rewind to beginning.\n");
-                               rewind(file);
-                               fread(transfer->buffer + bytes_read, 1, bytes_to_read - bytes_read, file);
-			       return 0;
-                       } else {
-                               return -1; /* not repeat mode, end of file */
-                       }
+		if( fd != NULL )
+		{
+			byte_count += transfer->valid_length;
+			bytes_to_read = transfer->valid_length;
 
+			if (limit_num_samples) {
+				if (bytes_to_read >= bytes_to_xfer) {
+					/*
+					 * In this condition, we probably tx some of the previous
+					 * buffer contents at the end.  :-(
+					 */
+					bytes_to_read = bytes_to_xfer;
+				}
+				bytes_to_xfer -= bytes_to_read;
+			}
+			bytes_read = fread(transfer->buffer, 1, bytes_to_read, fd);
+
+			/* for test
+			 * by zuko
+			 * */
+
+
+			if (limit_num_samples && (bytes_to_xfer == 0)) {
+				       return -1;
+			}
+			if (bytes_read != bytes_to_read) {
+			       if (repeat) {
+				       fprintf(stderr, "Input file end reached. Rewind to beginning.\n");
+				       rewind(fd);
+				       fread(transfer->buffer + bytes_read, 1, bytes_to_read - bytes_read, fd);
+				       return 0;
+			       } else {
+				       return -1; /* not repeat mode, end of file */
+			       }
+
+			} else {
+				return 0;
+			}
+		} else if (transceiver_mode == TRANSCEIVER_MODE_SS) {
+			/* Transmit continuous wave with specific amplitude */
+			byte_count += transfer->valid_length;
+			bytes_to_read = transfer->valid_length;
+			if (limit_num_samples) {
+				if (bytes_to_read >= bytes_to_xfer) {
+					bytes_to_read = bytes_to_xfer;
+				}
+				bytes_to_xfer -= bytes_to_read;
+			}
+
+			for(i = 0;i<bytes_to_read;i++)
+				transfer->buffer[i] = amplitude;
+
+			if (limit_num_samples && (bytes_to_xfer == 0)) {
+				return -1;
+			} else {
+				return 0;
+			}
 		} else {
-			return 0;
-		}
-	} else if (transceiver_mode == TRANSCEIVER_MODE_SS) {
-		/* Transmit continuous wave with specific amplitude */
+		return -1;
+   		 }
+
+	}
+
+	/* copy data in one nodei buffer(256K) of the ring list to transfer buffer
+	 * 2021-03-24 08:09:54
+	 * by zuko
+	 * */	
+	else
+	{	
 		byte_count += transfer->valid_length;
 		bytes_to_read = transfer->valid_length;
-		if (limit_num_samples) {
-			if (bytes_to_read >= bytes_to_xfer) {
-				bytes_to_read = bytes_to_xfer;
-			}
-			bytes_to_xfer -= bytes_to_read;
-		}
 
-		for(i = 0;i<bytes_to_read;i++)
-			transfer->buffer[i] = amplitude;
-
-		if (limit_num_samples && (bytes_to_xfer == 0)) {
+		/* if socket thread ends, tx_callback ends
+		 * 2021-04-07 04:15:54
+		 * by zuko
+		 * */
+		if (socket_thread_end == 1)
 			return -1;
-		} else {
+		if (p_read == p_write)
 			return 0;
-		}
-	} else {
-        return -1;
-    }
+		memcpy(transfer->buffer, p_read->buffer, NODE_BUFFER_SIZE);
+		p_read = p_read->next;
+		return 0;
+	}
+
+
+
 }
 
 static void usage() {
@@ -561,8 +695,14 @@ int main(int argc, char** argv) {
 	struct timeval t_end;
 	float time_diff;
 	unsigned int lna_gain=8, vga_gain=20, txvga_gain=0;
-  
-	while( (opt = getopt(argc, argv, "H:wr:t:f:i:o:m:a:p:s:n:b:l:g:x:c:d:C:RS:h?")) != EOF )
+
+	/* add option elements -L and -P
+	 * -L followed by the IP of the server to connect
+	 * -P followed by port 
+	 *  by zuko
+	 * 2020-11-18 16:51:49 
+	 * */
+	while( (opt = getopt(argc, argv, "H:wr:t:f:i:o:m:a:p:s:n:b:l:g:x:c:d:C:RS:L:P:h?")) != EOF )
 	{
 		result = HACKRF_SUCCESS;
 		switch( opt ) 
@@ -670,6 +810,19 @@ int main(int argc, char** argv) {
 			result = parse_u32(optarg, &crystal_correct_ppm);
 			break;
 
+
+		/*-----------------socket cases-----------------*/	
+		/* by zuko
+		 * 2020年 11月 18日 星期三 17:13:52 CST
+		 * */
+		case 'L':
+			using_socket = true;
+			s_host = optarg;
+			break;
+		case 'P':
+			s_port = atoi(optarg);
+			break;
+		/*-----------------socket cases end-----------------*/	
 		case 'h':
 		case '?':
 			usage();
@@ -828,8 +981,90 @@ int main(int argc, char** argv) {
 		return EXIT_FAILURE;
 	}
 
+	/*--------------------socket initialization--------------------*/
+	/**
+	 * 2020-11-11 16:27:17
+	 * by zuko
+	 */
+	if (using_socket)
+	{
+		if (s_host == 0 || s_port == 0)
+		{
+			fprintf(stderr, "error: -L -P parameters aren't referred.\n");
+			return EXIT_FAILURE;
+		}
+		printf("start socket initialization\n");
+
+		if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		{
+			printf("socket initialization failed: %s(errno: %d)\n", strerror(errno), errno);
+			return EXIT_FAILURE;
+		}
+		printf("socket initialization succeed.\n");
+
+		servaddr.sin_family = AF_INET;
+		servaddr.sin_port = htons(s_port);
+		servaddr.sin_addr.s_addr = inet_addr(s_host);
+		bzero(&(servaddr.sin_zero), sizeof(servaddr.sin_zero));
+
+		/* set buffer size
+		 * 2021年03月05日 星期五 16时17分42秒
+		 * by zuko 
+		 * */
+
+		if (receive)
+		{
+			// get initial send buffer size
+			optlen = sizeof(sbuf_size);
+			if (getsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sbuf_size, &optlen) < 0)
+				printf("erro: get initial send buffer size.\n");
+			else
+				printf("initial send buffer size: %d bytes\n", sbuf_size);
+
+			// enlarge send buffer size to SND_BUF_SIZE
+			sbuf_size = SND_BUF_SIZE;
+			optlen = sizeof(sbuf_size);
+			if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sbuf_size, optlen) < 0)
+				printf("erro: set send buffer size.\n");
+
+			// check send buffer size
+			optlen = sizeof(sbuf_size);
+			if (getsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sbuf_size, &optlen) < 0)
+				printf("erro: get new send buffer size.\n");
+			else
+				printf("enlarged send buffer size: %d bytes\n", sbuf_size);
+
+		}
+
+		else
+		{
+			// get initial receive buffer size
+			optlen = sizeof(sbuf_size);
+			if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sbuf_size, &optlen) < 0)
+				printf("erro: get initial receive buffer size.\n");
+			else
+				printf("initial receive buffer size: %d bytes\n", sbuf_size);
+
+			// enlarge receive buffer size to RCV_BUF_SIZE 
+			sbuf_size = RCV_BUF_SIZE;
+			optlen = sizeof(sbuf_size);
+			if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sbuf_size, optlen) < 0)
+				printf("erro: set receive buffer size.\n");
+
+			// check receive buffer size
+			optlen = sizeof(sbuf_size);
+			if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sbuf_size, &optlen) < 0)
+				printf("erro: get new receive buffer size.\n");
+			else
+				printf("enlarged receive buffer size: %d bytes\n", sbuf_size);
+
+		}
+		
+	}
+	/*--------------------socket initialization end-------------------*/
+
 	if( receive ) {
-		transceiver_mode = TRANSCEIVER_MODE_RX;
+		transceiver_mode = TRANSCEIVER_MODE_RX;			
 	}
 
 	if( transmit ) {
@@ -892,24 +1127,24 @@ int main(int argc, char** argv) {
 		if( transceiver_mode == TRANSCEIVER_MODE_RX )
 		{
 			if (strcmp(path, "-") == 0) {
-				file = stdout;
+				fd = stdout;
 			} else {
-				file = fopen(path, "wb");
+				fd = fopen(path, "wb");
 			}
 		} else {
 			if (strcmp(path, "-") == 0) {
-				file = stdin;
+				fd = stdin;
 			} else {
-				file = fopen(path, "rb");
+				fd = fopen(path, "rb");
 			}
 		}
 	
-		if( file == NULL ) {
+		if( fd == NULL ) {
 			fprintf(stderr, "Failed to open file: %s\n", path);
 			return EXIT_FAILURE;
 		}
-		/* Change file buffer to have bigger one to store or read data on/to HDD */
-		result = setvbuf(file , NULL , _IOFBF , FD_BUFFER_SIZE);
+		/* Change fd buffer to have bigger one to store or read data on/to HDD */
+		result = setvbuf(fd , NULL , _IOFBF , FD_BUFFER_SIZE);
 		if( result != 0 ) {
 			fprintf(stderr, "setvbuf() failed: %d\n", result);
 			usage();
@@ -920,7 +1155,7 @@ int main(int argc, char** argv) {
 	/* Write Wav header */
 	if( receive_wav ) 
 	{
-		fwrite(&wave_file_hdr, 1, sizeof(t_wav_file_hdr), file);
+		fwrite(&wave_file_hdr, 1, sizeof(t_wav_file_hdr), fd);
 	}
 	
 #ifdef _MSC_VER
@@ -960,11 +1195,69 @@ int main(int argc, char** argv) {
 	}
 
 	if( transceiver_mode == TRANSCEIVER_MODE_RX ) {
+		/*——————————————socket client connection——————————————*/
+		/* 2020-11-11 16:51:51
+		 * by zuko
+		 * */
+		if (using_socket)
+		{
+			fprintf(stderr, "start connection\n");
+			fprintf(stderr, "connect to %s:%d\n", s_host, s_port);
+			if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0)
+			{
+				fprintf(stderr, "connection failed: %s(errno: %d)\n", strerror(errno), errno);
+				return EXIT_FAILURE;
+			}
+			fprintf(stderr, "connection succeeded.\n");
+		}		
+		/*——————————————socket client connection end——————————————*/
+
 		result = hackrf_set_vga_gain(device, vga_gain);
 		result |= hackrf_set_lna_gain(device, lna_gain);
 		result |= hackrf_start_rx(device, rx_callback, NULL);
 	} else {
 		result = hackrf_set_txvga_gain(device, txvga_gain);
+
+		/*——————————————socket server listen——————————————*/
+		/* 2020年12月28日 星期一 15时46分17秒
+		 * by zuko
+		 * */
+		if (using_socket)
+		{
+			fprintf(stderr, "start to bind\n");
+			if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0)
+			{
+				fprintf(stderr, "server bind failed: %s(errno: %d)\n", strerror(errno), errno);
+				return EXIT_FAILURE;
+			}
+
+			fprintf(stderr, "server bind succeeded.\n");
+
+			if (listen(sockfd, SOCKET_LISTEN_LIST) < 0)
+			{
+				fprintf(stderr, "server listen failed: %s(errno: %d)\n", strerror(errno), errno);
+				return EXIT_FAILURE;
+			}
+
+			fprintf(stderr, "waiting for client...\n");
+
+			if ((connectfd = accept(sockfd, (struct sockaddr*)&clientaddr, &client_addr_len)) < 0)
+			{
+				
+				fprintf(stderr, "server accept failed: %s(errno: %d)\n", strerror(errno), errno);
+				return EXIT_FAILURE;
+			}
+
+			fprintf(stderr, "server accept succeeded.\n");
+
+			/* entrance of socket thread
+			 * 2021-03-24 08:00:28
+			 * by zuko
+			 * */
+			result |= socket_start_rx(&connectfd);
+		}
+		/*——————————————socket server listen end——————————————*/
+
 		result |= hackrf_start_tx(device, tx_callback, NULL);
 	}
 	if( result != HACKRF_SUCCESS ) {
@@ -1031,6 +1324,10 @@ int main(int argc, char** argv) {
 			(do_exit == false) ) 
 	{
 		uint32_t byte_count_now;
+		/* 2021年02月25日 星期四 14时20分30秒
+		 * by zuko
+		 * */
+		int callback_count_now;
 		struct timeval time_now;
 		float time_difference, rate;
 		if (stream_size>0) {
@@ -1045,7 +1342,7 @@ int main(int argc, char** argv) {
 			    	len=_st-stream_head;
 				else
 			    	len=stream_size-stream_head;
-				bytes_written = fwrite(stream_buf+stream_head, 1, len, file);
+				bytes_written = fwrite(stream_buf+stream_head, 1, len, fd);
 				if (len != bytes_written) {
 					fprintf(stderr, "write failed");
 					do_exit=true;
@@ -1062,6 +1359,8 @@ int main(int argc, char** argv) {
 			gettimeofday(&time_now, NULL);
 			
 			byte_count_now = byte_count;
+			callback_count_now = callback_count;
+			callback_count = 0;
 			byte_count = 0;
 			
 			
@@ -1072,6 +1371,15 @@ int main(int argc, char** argv) {
 			} else {
 			    fprintf(stderr, "%4.1f MiB / %5.3f sec = %4.1f MiB/second\n",
 					    (byte_count_now / 1e6f), time_difference, (rate / 1e6f) );
+#ifdef PRINT_DEBUGGING_MESSAGES
+			    /* print callback counts per sec
+			     * 2021年02月25日 星期四 14时33分00秒
+			     * by zuko
+			     * */
+			    fprintf(stderr, "callback count = %d\n", callback_count_now);
+			    fprintf(stderr, "p_write = %d\n", p_write->nodeno);
+			    fprintf(stderr, "p_read = %d\n", p_read->nodeno);
+#endif
 			}
 
 			time_start = time_now;
@@ -1084,6 +1392,13 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	/* 2021-04-12 10:13:09
+	 * by zuko*/
+	if (close(sockfd) == 0)
+		fprintf(stderr, "\nclose socketfd done\n");
+	else
+		fprintf(stderr, "close socketfd failed: %s(errno: %d)\n", strerror(errno), errno);
+
 	result = hackrf_is_streaming(device);	
 	if (do_exit)
 	{
@@ -1095,6 +1410,7 @@ int main(int argc, char** argv) {
 	gettimeofday(&t_end, NULL);
 	time_diff = TimevalDiff(&t_end, &t_start);
 	fprintf(stderr, "Total time: %5.5f s\n", time_diff);
+
 
 	if(device != NULL) {
 		if(receive || receive_wav) {
@@ -1126,29 +1442,24 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "hackrf_exit() done\n");
 	}
 
-	if(file != NULL)
+	if(fd != NULL)
 	{
 		if( receive_wav ) 
 		{
 			/* Get size of file */
-			file_pos = ftell(file);
+			file_pos = ftell(fd);
 			/* Update Wav Header */
 			wave_file_hdr.hdr.size = file_pos-8;
 			wave_file_hdr.fmt_chunk.dwSamplesPerSec = sample_rate_hz;
 			wave_file_hdr.fmt_chunk.dwAvgBytesPerSec = wave_file_hdr.fmt_chunk.dwSamplesPerSec*2;
 			wave_file_hdr.data_chunk.chunkSize = file_pos - sizeof(t_wav_file_hdr);
 			/* Overwrite header with updated data */
-			rewind(file);
-			fwrite(&wave_file_hdr, 1, sizeof(t_wav_file_hdr), file);
+			rewind(fd);
+			fwrite(&wave_file_hdr, 1, sizeof(t_wav_file_hdr), fd);
 		}	
-		if (file != stdin) {
-			fflush(file);
-		}
-		if ((file != stdout) && (file != stdin)) {
-			fclose(file);
-			file = NULL;
-			fprintf(stderr, "fclose() done\n");
-		}
+		fclose(fd);
+		fd = NULL;
+		fprintf(stderr, "fclose(fd) done\n");
 	}
 	fprintf(stderr, "exit\n");
 	return exit_code;
