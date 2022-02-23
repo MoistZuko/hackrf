@@ -24,6 +24,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #ifndef __HACKRF_H__
 #define __HACKRF_H__
 
+#include <bits/stdint-uintn.h>
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -50,6 +51,27 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #define SAMPLES_PER_BLOCK 8192
 #define BYTES_PER_BLOCK 16384
 #define MAX_SWEEP_RANGES 10
+
+/* print some debugging messages
+ * including callback counts per sec & p_read, p_write pointer
+ * 2021-04-12 09:54:19
+ * by zuko
+ * */
+#define PRINT_DEBUGGING_MESSAGES 
+
+/*------------------------------------------------*/
+/* define a ring list structer
+ * 2021-03-22 04:37:17
+ * by zuko
+ * */
+#define NODE_BUFFER_SIZE 262144
+typedef struct node{
+	uint16_t nodeno; // node number
+	uint8_t buffer[NODE_BUFFER_SIZE * 2]; // size * 2 to prevent overflow, 2021-04-16 04:36:24
+//	unsigned int length; // actual stored data length 
+	struct node * next;
+} *pNode;
+/*------------------------------------------------*/
 
 enum hackrf_error {
 	HACKRF_SUCCESS = 0,
@@ -139,6 +161,14 @@ typedef int (*hackrf_sample_block_cb_fn)(hackrf_transfer* transfer);
 extern "C"
 {
 #endif
+
+/*------------------------------------------------*/
+/* start to create a socket thread
+ * 2021-03-22 04:45:35
+ * by zuko
+ * */
+extern ADDAPI int ADDCALL socket_start_rx(int * cfd);
+/*------------------------------------------------*/
 
 extern ADDAPI int ADDCALL hackrf_init();
 extern ADDAPI int ADDCALL hackrf_exit();
